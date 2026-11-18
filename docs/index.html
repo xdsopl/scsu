@@ -1,0 +1,326 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SCSU Module</title>
+<style>
+body { color: white; background-color: black; }
+textarea { width: 100%; max-width: 50em; height: 6em; color: white; background-color: #111; border: 1px solid #444; font-size: 1.1em; }
+#sizes { font-family: monospace; margin: 0.5em 0; }
+#hex { font-family: monospace; white-space: pre-wrap; word-break: break-all; color: #aaa; }
+#output { font-family: monospace; white-space: pre-wrap; word-break: break-all; }
+#output h3 { font-family: sans-serif; margin: 1.5em 0 0.5em 0; }
+.passed { color: lime; }
+.failed { color: red; }
+</style>
+</head>
+<body>
+<script>
+const TLEN_MAX = 1 << 20;
+const BUF_MAX = 1 << 22;
+let wasm, text, scsu;
+let passed = 0, failed = 0;
+
+/* encoded by ICU's SCSU converter, so these check the decoder against another implementation */
+const known_answers = [
+	{ text: "Hungry. Anyone around 40m tonight? 73 de DL1ABC",
+		scsu: "48756e6772792e20416e796f6e652061726f756e642034306d20746f6e696768743f20373320646520444c31414243" },
+	{ text: "Привет всем! Кто сегодня на 40 метрах?",
+		scsu: "129fc0b8b2b5c220b2c1b5bc21209ac2be20c1b5b3beb4bdcf20bdb020343020bcb5c2c0b0c53f" },
+	{ text: "नमस्ते सबको, आज मुझे बहुत भूख लगी है।",
+		scsu: "14a8aeb8cda4c720b8ac95cb2c20869c20aec19dc720acb9c1a420adc29620b297c020b9c8e4" },
+	{ text: "大家好，我今天非常饿。",
+		scsu: "0f59275bb6597dff0c62114eca5929975e5e38997fef6082" },
+	{ text: "Hungry 🍕🍔 now 😋 73!",
+		scsu: "48756e677279200be1e6d5d4206e6f77200b01ec8b20373321" },
+	{ text: "QSL via büro. 東京 → Москва ✈",
+		scsu: "51534c207669612062fc726f2e200f67714eac0020ef439220129cbec1bab2b020184e88" },
+];
+
+const samples = {
+	"English": "Hungry. Anyone around 40m tonight? 73 de DL1ABC",
+	"German": "Grüße aus Köln, wir hören uns auf 80 m. Schöne Größe!",
+	"Russian": "Привет всем! Кто сегодня на 40 метрах? Хочу есть.",
+	"Greek": "Γεια σας από την Αθήνα, πεινάω πολύ σήμερα.",
+	"Arabic": "مرحبا بالجميع، أنا جائع جدا اليوم.",
+	"Hebrew": "שלום לכולם, אני רעב מאוד היום.",
+	"Hindi": "नमस्ते सबको, आज मुझे बहुत भूख लगी है।",
+	"Bengali": "সবাইকে নমস্কার, আজ আমার খুব খিদে পেয়েছে।",
+	"Tamil": "அனைவருக்கும் வணக்கம், இன்று எனக்கு மிகவும் பசிக்கிறது.",
+	"Thai": "สวัสดีทุกคน วันนี้ฉันหิวมาก",
+	"Japanese": "皆さんこんにちは、今日はとてもお腹が空いています。",
+	"Chinese": "大家好，我今天非常饿。今晚有人在四十米波段吗？",
+	"Korean": "안녕하세요 여러분, 오늘 정말 배고파요.",
+	"Emoji": "Hungry 🍕🍔 now 😋 73!",
+};
+
+/* reserved tags, undefined windows, truncated input and unpaired surrogates */
+const malformed = [
+	"0c", "0f f2", "01", "0b 00", "0e d8", "18", "18 00", "18 b0", "18 f8",
+	"0f e8", "0f e8 00", "0f f0 00", "0f d8", "0e d8 00", "0e dc 00", "0f dc 00",
+	"0e d8 00 41", "0f d8 00 00 41", "0f d8 00 f0 00 41",
+];
+
+/* overlong forms, surrogates, code points above U+10FFFF and broken sequences */
+const invalid_utf8 = [
+	"c0 80", "c1 bf", "e0 80 80", "e0 9f bf", "f0 80 80 80", "f0 8f bf bf", "ed a0 80", "ed bf bf",
+	"f4 90 80 80", "f5 80 80 80", "ff", "80", "c3", "e2 82", "f0 9f 8d", "c3 28", "e2 28 a1",
+];
+
+function print_str(str, cls) {
+	const div = document.createElement("div");
+	div.textContent = str;
+	if (cls)
+		div.className = cls;
+	document.getElementById("output").appendChild(div);
+}
+function print_head(str) {
+	const h3 = document.createElement("h3");
+	h3.textContent = str;
+	document.getElementById("output").appendChild(h3);
+}
+function to_hex(buffer) {
+	let str = "";
+	for (let i = 0; i < buffer.length; ++i)
+		str += buffer[i].toString(16).padStart(2, '0').toUpperCase();
+	return str;
+}
+function from_hex(str) {
+	str = str.replace(/ /g, "");
+	const buffer = new Uint8Array(str.length / 2);
+	for (let i = 0; i < buffer.length; ++i)
+		buffer[i] = parseInt(str.substr(2 * i, 2), 16);
+	return buffer;
+}
+function from_text(str) {
+	return new TextEncoder().encode(str);
+}
+function to_text(buffer) {
+	return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+}
+function random_int(n) {
+	return Math.floor(Math.random() * n);
+}
+function equal(a, b) {
+	if (!a || !b || a.length != b.length)
+		return false;
+	for (let i = 0; i < a.length; ++i)
+		if (a[i] != b[i])
+			return false;
+	return true;
+}
+function ms(start, end) {
+	return (end - start).toFixed(2) + " ms";
+}
+function mb_per_s(bytes, start, end) {
+	return (bytes / 1e3 / (end - start)).toPrecision(3) + " MB/s";
+}
+function pause() {
+	return new Promise(resolve => setTimeout(resolve, 0));
+}
+async function test(what, func) {
+	print_str("Testing " + what);
+	await pause();
+	const start = performance.now();
+	let result;
+	try {
+		result = func();
+	} catch (error) {
+		print_str("  " + error);
+		result = false;
+	}
+	const end = performance.now();
+	if (result) {
+		++passed;
+		print_str("  passed in " + ms(start, end), "passed");
+	} else {
+		++failed;
+		print_str("  FAILED in " + ms(start, end), "failed");
+	}
+}
+
+function encode(utf8) {
+	text.set(utf8);
+	const len = wasm.scsu_encode(utf8.length);
+	if (len < 0)
+		return null;
+	return scsu.slice(0, len);
+}
+function decode(bytes) {
+	scsu.set(bytes);
+	const len = wasm.scsu_decode(bytes.length);
+	if (len < 0)
+		return null;
+	return text.slice(0, len);
+}
+function round_trip(str) {
+	const utf8 = from_text(str);
+	const bytes = encode(utf8);
+	return bytes !== null && equal(decode(bytes), utf8);
+}
+
+/* random text in runs from a few blocks, like real mixed-script posts */
+const blocks = [[0x20, 0x7F], [0x00, 0x20], [0x80, 0x250], [0x370, 0x530], [0x590, 0x700],
+	[0x900, 0xE00], [0x2000, 0x2200], [0x3000, 0x3100], [0x4E00, 0x9FFF], [0xAC00, 0xD7A3],
+	[0xE000, 0xF900], [0xFE00, 0x10000], [0x1F300, 0x1FAFF], [0x20000, 0x2A6DF], [0xF0000, 0x110000]];
+function random_string() {
+	let str = "";
+	for (let r = 1 + random_int(5); r--;) {
+		const [lo, hi] = blocks[random_int(blocks.length)];
+		for (let n = 1 + random_int(30); n--;) {
+			const c = lo + random_int(hi - lo);
+			if (c < 0xD800 || c >= 0xE000)
+				str += String.fromCodePoint(c);
+		}
+	}
+	return str;
+}
+
+async function hello_world_tests() {
+	print_head("Hello World");
+	await test("\"Hello World!\" stays as it is", () => {
+		const utf8 = from_text("Hello World!");
+		return equal(encode(utf8), utf8) && equal(decode(utf8), utf8);
+	});
+	await test("\"Привет, мир!\" round trip", () => round_trip("Привет, мир!"));
+}
+
+async function known_answer_tests() {
+	print_head("Known answers from ICU");
+	for (const answer of known_answers)
+		await test("decoding \"" + answer.text + "\"", () => equal(decode(from_hex(answer.scsu)), from_text(answer.text)));
+}
+
+async function sample_tests() {
+	print_head("Samples");
+	for (const [name, str] of Object.entries(samples)) {
+		await test(name, () => {
+			const utf8 = from_text(str);
+			const bytes = encode(utf8);
+			if (bytes === null || !equal(decode(bytes), utf8))
+				return false;
+			print_str("  UTF-8: " + utf8.length + " bytes, SCSU: " + bytes.length + " bytes");
+			return bytes.length <= utf8.length;
+		});
+	}
+}
+
+async function rejection_tests() {
+	print_head("Rejection");
+	for (const hex of malformed)
+		await test("decoder refuses " + hex.toUpperCase(), () => decode(from_hex(hex)) === null);
+	for (const hex of invalid_utf8)
+		await test("encoder refuses UTF-8 " + hex.toUpperCase(), () => encode(from_hex(hex)) === null);
+}
+
+async function argument_tests() {
+	print_head("Arguments");
+	await test("negative lengths", () => wasm.scsu_encode(-1) == -1 && wasm.scsu_decode(-1) == -1);
+	await test("lengths above the limit", () => wasm.scsu_encode(TLEN_MAX + 1) == -1 && wasm.scsu_decode(TLEN_MAX + 1) == -1);
+	await test("empty input", () => wasm.scsu_encode(0) == 0 && wasm.scsu_decode(0) == 0);
+}
+
+async function random_tests() {
+	print_head("Random");
+	await test("10000 random mixed-script strings round trip", () => {
+		for (let i = 0; i < 10000; ++i)
+			if (!round_trip(random_string()))
+				return false;
+		return true;
+	});
+	await test("10000 random byte strings never decode to invalid UTF-8", () => {
+		for (let i = 0; i < 10000; ++i) {
+			const bytes = new Uint8Array(1 + random_int(40));
+			crypto.getRandomValues(bytes);
+			const out = decode(bytes);
+			if (out !== null)
+				to_text(out);
+		}
+		return true;
+	});
+	await test("the largest input", () => {
+		let str = "";
+		while (from_text(str).length < TLEN_MAX - 1000)
+			str += random_string();
+		const utf8 = from_text(str).subarray(0, TLEN_MAX);
+		let end = utf8.length;
+		while ((utf8[end] & 0xC0) == 0x80)
+			--end;
+		return round_trip(to_text(utf8.subarray(0, end)));
+	});
+}
+
+async function speed_tests() {
+	print_head("Speed");
+	await test("1 MiB of Hindi", () => {
+		let str = "";
+		while (from_text(str).length < TLEN_MAX - 200)
+			str += samples["Hindi"];
+		const utf8 = from_text(str);
+		let start = performance.now();
+		const bytes = encode(utf8);
+		let end = performance.now();
+		print_str("  scsu_encode: " + ms(start, end) + ", " + mb_per_s(utf8.length, start, end));
+		start = performance.now();
+		const out = decode(bytes);
+		end = performance.now();
+		print_str("  scsu_decode: " + ms(start, end) + ", " + mb_per_s(utf8.length, start, end));
+		return equal(out, utf8);
+	});
+}
+
+async function run_tests() {
+	const start = performance.now();
+	await hello_world_tests();
+	await known_answer_tests();
+	await sample_tests();
+	await rejection_tests();
+	await argument_tests();
+	await random_tests();
+	await speed_tests();
+	const end = performance.now();
+	print_head("Summary");
+	print_str(passed + " tests passed, " + failed + " tests failed, " + ms(start, end) + " in total", failed ? "failed" : "passed");
+}
+
+function update_demo() {
+	const utf8 = from_text(document.getElementById("input").value);
+	if (utf8.length > TLEN_MAX) {
+		document.getElementById("sizes").textContent = "too long";
+		return;
+	}
+	const bytes = encode(utf8);
+	const saved = utf8.length ? Math.round(100 * (1 - bytes.length / utf8.length)) : 0;
+	document.getElementById("sizes").textContent = "UTF-8: " + utf8.length + " bytes, SCSU: " + bytes.length + " bytes (" + saved + "% smaller)";
+	document.getElementById("hex").textContent = to_hex(bytes);
+}
+
+WebAssembly.instantiateStreaming(fetch("scsu.wasm"))
+	.then(obj => {
+		wasm = obj.instance.exports;
+		const buffer = wasm.memory.buffer;
+		text = new Uint8Array(buffer, wasm.text.value, BUF_MAX);
+		scsu = new Uint8Array(buffer, wasm.scsu.value, BUF_MAX);
+		document.getElementById("input").addEventListener("input", update_demo);
+		update_demo();
+		run_tests();
+	});
+</script>
+<p>
+<h1>Compressing Unicode with SCSU</h1>
+WebAssembly module for the Standard Compression Scheme for Unicode (UTS #6)<br />
+Copyright 2026 Ahmet Inan &lt;xdsopl@gmail.com&gt;<br />
+Source code: <a href="https://github.com/xdsopl/scsu" style="color: aqua;">github.com/xdsopl/scsu</a><br />
+</p>
+<p>
+<b>Disclaimer:</b> this is an experiment, not a vetted library. It comes without any warranty.
+</p>
+<p>
+Type or paste any text:<br />
+<textarea id="input">नमस्ते सबको, आज मुझे बहुत भूख लगी है।</textarea>
+<div id="sizes"></div>
+<div id="hex"></div>
+</p>
+<div id="output"></div>
+</body>
+</html>
