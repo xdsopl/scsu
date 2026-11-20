@@ -92,7 +92,21 @@ for (let t = 0; t < 100000; ++t) {
 	}
 	check(s);
 }
-console.log("encoder: 100000 random strings byte-identical");
+// long strings of many short runs, so the encoder keeps replacing windows
+for (let t = 0; t < 3000; ++t) {
+	let s = "";
+	for (let r = 20 + rand(60); r; --r) {
+		const [lo, hi] = blocks[rand(blocks.length)];
+		const base = lo + rand(hi - lo);
+		for (let k = 1 + rand(6); k; --k) {
+			const c = Math.min(base + rand(0x100), 0x10FFFF);
+			if (c < 0xD800 || c >= 0xE000)
+				s += String.fromCodePoint(c);
+		}
+	}
+	check(s);
+}
+console.log("encoder: 103000 random strings byte-identical");
 
 // lone surrogates in a JS string are refused like invalid UTF-8
 for (const s of ["\uD800", "a\uDC00", "\uD800a", "\uDBFF\uDBFF"])

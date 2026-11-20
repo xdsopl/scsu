@@ -250,20 +250,18 @@ function utf8ToPoints(text) {
 	return count;
 }
 
-// encoder state
-const dynamic = new Int32Array(8);
-const stamp = new Float64Array(8);
-let clock = 0, active = 0, unicode = false, pos = 0;
+// The encoder keeps its state in locals of encodePoints and passes it to
+// small helpers as arguments: V8 inlines those, while module-level mutable
+// state would be reloaded and checked on every access.
 
-function put(b) {
-	out[pos++] = b;
-}
+const encDynamic = new Int32Array(8);
+const encStamp = new Float64Array(8);
 
 function direct(c) {
 	return (c >= 0x20 && c < 0x80) || c === 0x00 || c === 0x09 || c === 0x0A || c === 0x0D;
 }
 
-function findWindow(c) {
+function findWindow(dynamic, active, c) {
 	if (c >= dynamic[active] && c < dynamic[active] + 0x80)
 		return active;
 	for (let n = 0; n < 8; ++n)
@@ -272,16 +270,34 @@ function findWindow(c) {
 	return -1;
 }
 
-// window index x for SDn, or -1 if c can't be reached through a BMP window
+// window index x for SDn, or -1 if c can't be reached through a BMP window,
+// with the special offsets taking precedence in the order of SPECIAL_OFFSET
 function defineIndex(c) {
-	for (let x = 0; x < 7; ++x)
-		if (c >= SPECIAL_OFFSET[x] && c < SPECIAL_OFFSET[x] + 0x80)
-			return 0xF9 + x;
-	if (c >= 0x80 && c < 0x3400)
-		return c >> 7;
-	if (c >= 0xE000 && c < 0x10000)
-		return (c - 0xAC00) >> 7;
-	return -1;
+	if (c < 0x3400) {
+		if (c < 0x05B0) {
+			if (c >= 0x00C0 && c < 0x0140)
+				return 0xF9;
+			if (c >= 0x0250 && c < 0x02D0)
+				return 0xFA;
+			if (c >= 0x0370 && c < 0x03F0)
+				return 0xFB;
+			if (c >= 0x0530)
+				return 0xFC;
+		} else if (c >= 0x3040 && c < 0x3120) {
+			return c < 0x30C0 ? 0xFD : 0xFE;
+		}
+		return c >= 0x80 ? c >> 7 : -1;
+	}
+	if (c < 0xE000 || c >= 0x10000)
+		return -1;
+	if (c >= 0xFF60 && c < 0xFFE0)
+		return 0xFF;
+	return (c - 0xAC00) >> 7;
+}
+
+// can c be defined as a window, by SDn/UDn or SDX/UDX
+function definable(c) {
+	return c >= 0x10000 || defineIndex(c) >= 0;
 }
 
 function sameWindow(a, b) {
@@ -291,12 +307,10 @@ function sameWindow(a, b) {
 	if (x < 0)
 		return false;
 	const offset = windowOffset(x);
-	if (offset < 0)
-		return false;
-	return b >= offset && b < offset + 0x80;
+	return offset >= 0 && b >= offset && b < offset + 0x80;
 }
 
-function oldest() {
+function oldest(stamp) {
 	let best = 0;
 	for (let n = 1; n < 8; ++n)
 		if (stamp[n] < stamp[best])
@@ -304,149 +318,161 @@ function oldest() {
 	return best;
 }
 
-function touch(n) {
-	stamp[n] = ++clock;
-}
-
-// define a window for c with tag SDn/SDX (single-byte) or UDn/UDX (unicode)
-function define(c) {
-	const n = oldest();
+// write the tag that defines window n for c, SDn/SDX or UDn/UDX, return the new position
+function defineWindow(o, pos, dynamic, n, c, unicode) {
 	if (c >= 0x10000) {
 		const index = (c - 0x10000) >> 7;
-		put(unicode ? UDX : SDX);
-		put(n << 5 | index >> 8);
-		put(index & 0xFF);
+		o[pos++] = unicode ? UDX : SDX;
+		o[pos++] = n << 5 | index >> 8;
+		o[pos++] = index & 0xFF;
 		dynamic[n] = 0x10000 + index * 0x80;
 	} else {
 		const x = defineIndex(c);
-		put((unicode ? UD0 : SD0) + n);
-		put(x);
+		o[pos++] = (unicode ? UD0 : SD0) + n;
+		o[pos++] = x;
 		dynamic[n] = windowOffset(x);
 	}
-	active = n;
-	unicode = false;
-	touch(n);
+	return pos;
 }
 
-function putUTF16(c, quote) {
+// write c as UTF-16, quoted when quote is not 0, return the new position
+function putUTF16(o, pos, c, quote) {
 	if (c >= 0x10000) {
 		const h = 0xD800 + ((c - 0x10000) >> 10);
 		const l = 0xDC00 + ((c - 0x10000) & 0x3FF);
 		if (quote)
-			put(quote);
-		put(h >> 8);
-		put(h & 0xFF);
+			o[pos++] = quote;
+		o[pos++] = h >> 8;
+		o[pos++] = h & 0xFF;
 		if (quote)
-			put(quote);
-		put(l >> 8);
-		put(l & 0xFF);
-		return;
+			o[pos++] = quote;
+		o[pos++] = l >> 8;
+		o[pos++] = l & 0xFF;
+		return pos;
 	}
 	if (!quote && c >> 8 >= 0xE0 && c >> 8 <= 0xF2)
 		quote = UQU;
 	if (quote)
-		put(quote);
-	put(c >> 8);
-	put(c & 0xFF);
-}
-
-// can c be written as a single byte without defining a window
-function byteable(c) {
-	return direct(c) || findWindow(c) >= 0;
-}
-
-function encodeByteMode(k, count) {
-	const c = points[k];
-	const hasNext = k + 1 < count;
-	const next = hasNext ? points[k + 1] : 0;
-	if (direct(c)) {
-		put(c);
-		return;
-	}
-	if (c < 0x80) {
-		put(SQ0);
-		put(c);
-		return;
-	}
-	let n = findWindow(c);
-	if (n >= 0) {
-		touch(n);
-		if (n === active) {
-			put(0x80 + c - dynamic[n]);
-			return;
-		}
-		if (hasNext && !direct(next) && next >= dynamic[n] && next < dynamic[n] + 0x80) {
-			active = n;
-			put(SC0 + n);
-		} else {
-			put(SQ0 + n);
-		}
-		put(0x80 + c - dynamic[n]);
-		return;
-	}
-	if (c >= 0x10000 || defineIndex(c) >= 0) {
-		if (!hasNext || !sameWindow(c, next)) {
-			for (n = 1; n < 8; ++n) {
-				if (c >= STATIC_OFFSET[n] && c < STATIC_OFFSET[n] + 0x80) {
-					put(SQ0 + n);
-					put(c - STATIC_OFFSET[n]);
-					return;
-				}
-			}
-		}
-		define(c);
-		put(0x80 + c - dynamic[active]);
-		return;
-	}
-	if (hasNext && !byteable(next)) {
-		unicode = true;
-		put(SCU);
-		putUTF16(c, 0);
-		return;
-	}
-	putUTF16(c, SQU);
-}
-
-function encodeUnicodeMode(k, count) {
-	const c = points[k];
-	const hasNext = k + 1 < count;
-	const next = hasNext ? points[k + 1] : 0;
-	if (byteable(c) && (!hasNext || byteable(next))) {
-		const n = direct(c) ? active : findWindow(c);
-		active = n;
-		unicode = false;
-		touch(n);
-		put(UC0 + n);
-		encodeByteMode(k, count);
-		return;
-	}
-	if ((c >= 0x10000 || defineIndex(c) >= 0) && hasNext && sameWindow(c, next)) {
-		define(c);
-		put(0x80 + c - dynamic[active]);
-		return;
-	}
-	putUTF16(c, 0);
+		o[pos++] = quote;
+	o[pos++] = c >> 8;
+	o[pos++] = c & 0xFF;
+	return pos;
 }
 
 function encodePoints(count) {
 	// no step writes more than four bytes per code point
 	if (out.length < 4 * count)
 		out = new Uint8Array(4 * count);
+	const o = out, p = points, dynamic = encDynamic, stamp = encStamp;
 	for (let n = 0; n < 8; ++n) {
 		dynamic[n] = INITIAL_OFFSET[n];
 		stamp[n] = 0;
 	}
-	clock = 0;
-	active = 0;
-	unicode = false;
-	pos = 0;
+	let clock = 0, active = 0, unicode = false, pos = 0;
 	for (let k = 0; k < count; ++k) {
-		if (unicode)
-			encodeUnicodeMode(k, count);
-		else
-			encodeByteMode(k, count);
+		const c = p[k];
+		const hasNext = k + 1 < count;
+		const next = hasNext ? p[k + 1] : 0;
+		// U+3400 to U+DFFF (CJK, Hangul) lie in no window and can't get one:
+		// in unicode mode they are always written as they are
+		if (unicode && c >= 0x3400 && c < 0xE000) {
+			o[pos++] = c >> 8;
+			o[pos++] = c & 0xFF;
+			continue;
+		}
+		if (unicode) {
+			// byteable(c) && (!hasNext || byteable(next))
+			const isDirect = direct(c);
+			const w = isDirect ? active : findWindow(dynamic, active, c);
+			if (w >= 0 && (!hasNext || direct(next) || findWindow(dynamic, active, next) >= 0)) {
+				active = w;
+				unicode = false;
+				stamp[w] = ++clock;
+				o[pos++] = UC0 + w;
+				// and on to byte mode for c
+			} else if (hasNext && definable(c) && sameWindow(c, next)) {
+				const n = oldest(stamp);
+				pos = defineWindow(o, pos, dynamic, n, c, true);
+				active = n;
+				unicode = false;
+				stamp[n] = ++clock;
+				o[pos++] = 0x80 + c - dynamic[n];
+				continue;
+			} else {
+				pos = putUTF16(o, pos, c, 0);
+				continue;
+			}
+		}
+		// a run of characters that are direct or in the active window needs no
+		// lookahead and touches only the active window, so it is stamped once
+		const lo = dynamic[active];
+		if (direct(c) || (c >= lo && c < lo + 0x80)) {
+			let d = c, touched = false;
+			for (;;) {
+				if (d < 0x80) {
+					o[pos++] = d;
+				} else {
+					o[pos++] = 0x80 + d - lo;
+					touched = true;
+				}
+				if (k + 1 >= count)
+					break;
+				d = p[k + 1];
+				if (!direct(d) && !(d >= lo && d < lo + 0x80))
+					break;
+				++k;
+			}
+			if (touched)
+				stamp[active] = ++clock;
+			continue;
+		}
+		if (c < 0x80) {
+			o[pos++] = SQ0;
+			o[pos++] = c;
+			continue;
+		}
+		let n = c >= 0x3400 && c < 0xE000 ? -1 : findWindow(dynamic, active, c);
+		if (n >= 0) {
+			stamp[n] = ++clock;
+			if (n !== active) {
+				if (hasNext && !direct(next) && next >= dynamic[n] && next < dynamic[n] + 0x80) {
+					active = n;
+					o[pos++] = SC0 + n;
+				} else {
+					o[pos++] = SQ0 + n;
+				}
+			}
+			o[pos++] = 0x80 + c - dynamic[n];
+			continue;
+		}
+		if ((c < 0x3400 || c >= 0xE000) && definable(c)) {
+			if (!hasNext || !sameWindow(c, next)) {
+				// isolated characters go through a static window where there is one
+				for (n = 1; n < 8; ++n)
+					if (c >= STATIC_OFFSET[n] && c < STATIC_OFFSET[n] + 0x80)
+						break;
+				if (n < 8) {
+					o[pos++] = SQ0 + n;
+					o[pos++] = c - STATIC_OFFSET[n];
+					continue;
+				}
+			}
+			n = oldest(stamp);
+			pos = defineWindow(o, pos, dynamic, n, c, false);
+			active = n;
+			stamp[n] = ++clock;
+			o[pos++] = 0x80 + c - dynamic[n];
+			continue;
+		}
+		if (hasNext && !direct(next) && findWindow(dynamic, active, next) < 0) {
+			unicode = true;
+			o[pos++] = SCU;
+			pos = putUTF16(o, pos, c, 0);
+			continue;
+		}
+		pos = putUTF16(o, pos, c, SQU);
 	}
-	return out.slice(0, pos);
+	return o.slice(0, pos);
 }
 
 export function encode(str) {
