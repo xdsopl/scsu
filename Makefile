@@ -11,6 +11,10 @@ docs/scsu.wasm: temp/scsu.wasm
 	mkdir -p docs
 	cp $< $@
 
+docs/scsu.js: module/scsu.js
+	mkdir -p docs
+	cp $< $@
+
 temp/scsu.wasm: temp/scsu.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
@@ -24,9 +28,10 @@ temp/libscsu.so: module/scsu.c
 
 .PHONY: check webserver clean
 
-check: temp/libscsu.so docs/scsu.wasm
+check: temp/libscsu.so docs/scsu.wasm docs/scsu.js
 	python3 -I tests/check_icu.py temp/libscsu.so
 	node tests/check_wasm.mjs docs/scsu.wasm
+	node tests/check_js.mjs docs/scsu.wasm
 
 webserver:
 	python3 -m http.server 8080 --bind 127.0.0.1 --directory docs

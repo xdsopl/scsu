@@ -15,10 +15,11 @@ textarea { width: 100%; max-width: 50em; height: 6em; color: white; background-c
 </style>
 </head>
 <body>
-<script>
+<script type="module">
+import * as SCSU from "./scsu.js";
+
+/* the input limit of the WebAssembly module, which the JavaScript version doesn't have */
 const TLEN_MAX = 1 << 20;
-const BUF_MAX = 1 << 22;
-let wasm, text, scsu;
 let passed = 0, failed = 0;
 
 /* encoded by ICU's SCSU converter, so these check the decoder against another implementation */
@@ -140,18 +141,10 @@ async function test(what, func) {
 }
 
 function encode(utf8) {
-	text.set(utf8);
-	const len = wasm.scsu_encode(utf8.length);
-	if (len < 0)
-		return null;
-	return scsu.slice(0, len);
+	return SCSU.encodeUTF8(utf8);
 }
 function decode(bytes) {
-	scsu.set(bytes);
-	const len = wasm.scsu_decode(bytes.length);
-	if (len < 0)
-		return null;
-	return text.slice(0, len);
+	return SCSU.decodeUTF8(bytes);
 }
 function round_trip(str) {
 	const utf8 = from_text(str);
@@ -215,9 +208,16 @@ async function rejection_tests() {
 
 async function argument_tests() {
 	print_head("Arguments");
-	await test("negative lengths", () => wasm.scsu_encode(-1) == -1 && wasm.scsu_decode(-1) == -1);
-	await test("lengths above the limit", () => wasm.scsu_encode(TLEN_MAX + 1) == -1 && wasm.scsu_decode(TLEN_MAX + 1) == -1);
-	await test("empty input", () => wasm.scsu_encode(0) == 0 && wasm.scsu_decode(0) == 0);
+	await test("empty input", () => {
+		const empty = new Uint8Array(0);
+		return equal(encode(empty), empty) && equal(decode(empty), empty)
+			&& SCSU.encode("").length == 0 && SCSU.decode(empty) === "";
+	});
+	await test("input above the 1 MiB limit of the WebAssembly module", () => {
+		const utf8 = from_text("Привет всем! ".repeat(50000));
+		return utf8.length > TLEN_MAX && round_trip(to_text(utf8));
+	});
+	await test("lone surrogates in strings", () => SCSU.encode("\uD800") === null && SCSU.encode("a\uDC00") === null);
 }
 
 async function random_tests() {
@@ -250,6 +250,25 @@ async function random_tests() {
 	});
 }
 
+/* JavaScript runs in the interpreter until the engine compiles it, so the
+first run includes that warm-up, while the best of ten shows the compiled speed */
+function timing(name, bytes, func, arg) {
+	let start = performance.now();
+	const result = func(arg);
+	let end = performance.now();
+	const first = end - start;
+	let best = first;
+	for (let i = 0; i < 10; ++i) {
+		start = performance.now();
+		func(arg);
+		end = performance.now();
+		best = Math.min(best, end - start);
+	}
+	print_str("  " + name + ": first " + first.toFixed(2) + " ms, best of 10 " + best.toFixed(2) + " ms, "
+		+ mb_per_s(bytes, 0, best));
+	return result;
+}
+
 async function speed_tests() {
 	print_head("Speed");
 	await test("1 MiB of Hindi", () => {
@@ -257,15 +276,11 @@ async function speed_tests() {
 		while (from_text(str).length < TLEN_MAX - 200)
 			str += samples["Hindi"];
 		const utf8 = from_text(str);
-		let start = performance.now();
-		const bytes = encode(utf8);
-		let end = performance.now();
-		print_str("  scsu_encode: " + ms(start, end) + ", " + mb_per_s(utf8.length, start, end));
-		start = performance.now();
-		const out = decode(bytes);
-		end = performance.now();
-		print_str("  scsu_decode: " + ms(start, end) + ", " + mb_per_s(utf8.length, start, end));
-		return equal(out, utf8);
+		const bytes = timing("encodeUTF8", utf8.length, SCSU.encodeUTF8, utf8);
+		const out = timing("decodeUTF8", utf8.length, SCSU.decodeUTF8, bytes);
+		const fromString = timing("encode from string", utf8.length, SCSU.encode, str);
+		const decoded = timing("decode to string", utf8.length, SCSU.decode, bytes);
+		return equal(out, utf8) && equal(fromString, bytes) && decoded === str;
 	});
 }
 
@@ -285,30 +300,19 @@ async function run_tests() {
 
 function update_demo() {
 	const utf8 = from_text(document.getElementById("input").value);
-	if (utf8.length > TLEN_MAX) {
-		document.getElementById("sizes").textContent = "too long";
-		return;
-	}
 	const bytes = encode(utf8);
 	const saved = utf8.length ? Math.round(100 * (1 - bytes.length / utf8.length)) : 0;
 	document.getElementById("sizes").textContent = "UTF-8: " + utf8.length + " bytes, SCSU: " + bytes.length + " bytes (" + saved + "% smaller)";
 	document.getElementById("hex").textContent = to_hex(bytes);
 }
 
-WebAssembly.instantiateStreaming(fetch("scsu.wasm"))
-	.then(obj => {
-		wasm = obj.instance.exports;
-		const buffer = wasm.memory.buffer;
-		text = new Uint8Array(buffer, wasm.text.value, BUF_MAX);
-		scsu = new Uint8Array(buffer, wasm.scsu.value, BUF_MAX);
-		document.getElementById("input").addEventListener("input", update_demo);
-		update_demo();
-		run_tests();
-	});
+document.getElementById("input").addEventListener("input", update_demo);
+update_demo();
+run_tests();
 </script>
 <p>
 <h1>Compressing Unicode with SCSU</h1>
-WebAssembly module for the Standard Compression Scheme for Unicode (UTS #6)<br />
+JavaScript module for the Standard Compression Scheme for Unicode (UTS #6)<br />
 Copyright 2026 Ahmet Inan &lt;xdsopl@gmail.com&gt;<br />
 Source code: <a href="https://github.com/xdsopl/scsu" style="color: aqua;">github.com/xdsopl/scsu</a><br />
 </p>
