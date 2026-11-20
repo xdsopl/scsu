@@ -57,21 +57,33 @@ function repeatTo(s, utf8Bytes) {
 	return r;
 }
 
-// runs fn until ~150 ms have passed, after a warm-up; returns ns per call
-function time(fn, arg) {
-	for (let i = 0; i < 50; ++i)
+// calls fn n times, returns ns per call
+function run(fn, arg, n) {
+	const start = performance.now();
+	for (let i = 0; i < n; ++i)
 		fn(arg);
-	let n = 1, elapsed;
-	for (;;) {
-		const start = performance.now();
-		for (let i = 0; i < n; ++i)
-			fn(arg);
-		elapsed = performance.now() - start;
-		if (elapsed > 150)
-			break;
-		n *= 2;
+	return (performance.now() - start) * 1e6 / n;
+}
+
+// times both in alternating rounds of ~20 ms after a warm-up and keeps the
+// best round of each, so noise from the machine hits both the same way
+function time(a, b, arg) {
+	let n = 1;
+	for (let i = 0; i < 20; ++i) {
+		a(arg);
+		b(arg);
 	}
-	return elapsed * 1e6 / n;
+	while (run(a, arg, n) * n < 20e6 && n < 1 << 20)
+		n *= 2;
+	let m = 1;
+	while (run(b, arg, m) * m < 20e6 && m < 1 << 20)
+		m *= 2;
+	let ta = Infinity, tb = Infinity;
+	for (let r = 0; r < 7; ++r) {
+		ta = Math.min(ta, run(a, arg, n));
+		tb = Math.min(tb, run(b, arg, m));
+	}
+	return [ta, tb];
 }
 
 function fmt(ns) {
@@ -87,8 +99,7 @@ for (const [sizeName, size] of sizes) {
 		const b = W.encode(str);
 		const row = { size: sizeName, script, utf8: u.length, scsu: b.length };
 		for (const [op, arg] of [["encode", str], ["decode", b], ["encodeUTF8", u], ["decodeUTF8", b]]) {
-			const tw = time(W[op], arg);
-			const tj = time(js[op], arg);
+			const [tw, tj] = time(W[op], js[op], arg);
 			row[op] = `${fmt(tw)} / ${fmt(tj)} (${(tj / tw).toFixed(2)}x)`;
 		}
 		rows.push(row);
