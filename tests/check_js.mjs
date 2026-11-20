@@ -54,6 +54,10 @@ const samples = [
 	"Hungry 🍕🍔 now 😋 73!",
 	"QSL via büro. 東京 → Москва ✈ नमस्ते 𝔘𝔫𝔦𝔠𝔬𝔡𝔢",
 	"",
+	"\uFEFF",
+	"\uFEFFHungry",
+	"Hungry\uFEFF",
+	"73 \uFEFFПривет",
 ];
 
 function check(s) {

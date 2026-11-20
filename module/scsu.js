@@ -231,8 +231,9 @@ function directPrefix(s) {
 }
 
 // the scratch buffer is in platform byte order, which is little-endian everywhere JS runs
-const utf16Decoder = new TextDecoder("utf-16le");
-const asciiDecoder = new TextDecoder("utf-8");
+// ignoreBOM keeps a U+FEFF at the start of each piece, which is text here
+const utf16Decoder = new TextDecoder("utf-16le", { ignoreBOM: true });
+const asciiDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 // TextDecoder beats String.fromCharCode even on a few characters
 function unitsToString(len) {
