@@ -36,82 +36,107 @@ let units = new Uint16Array(2048);
 
 /* ---------------- decoder ---------------- */
 
-let ulen = 0, high = 0;
+// The decoder keeps its state in locals, like the encoder below. It writes
+// UTF-16, which SCSU is built on, and checks it as it goes: no lone
+// surrogates and nothing above U+10FFFF, as UTF-8 can't hold them.
 
-// emit a code point that is not a surrogate, unless a high surrogate waits
-function putPoint(c) {
-	if (high || c > 0x10FFFF || (c >= 0xD800 && c < 0xE000))
-		return true;
+const decDynamic = new Int32Array(8);
+let utf8 = new Uint8Array(4096);
+
+// write a code point that is not a surrogate, return the new length or -1
+function putPoint(u, n, c) {
 	if (c < 0x10000) {
-		units[ulen++] = c;
-	} else {
-		c -= 0x10000;
-		units[ulen++] = 0xD800 + (c >> 10);
-		units[ulen++] = 0xDC00 + (c & 0x3FF);
+		if (c >= 0xD800 && c < 0xE000)
+			return -1;
+		u[n++] = c;
+		return n;
 	}
-	return false;
+	if (c > 0x10FFFF)
+		return -1;
+	c -= 0x10000;
+	u[n++] = 0xD800 + (c >> 10);
+	u[n++] = 0xDC00 + (c & 0x3FF);
+	return n;
 }
 
-// emit one UTF-16 code unit, pairing surrogates
-function putUnit(u) {
-	if (high) {
-		if (u < 0xDC00 || u >= 0xE000)
-			return true;
-		units[ulen++] = high;
-		units[ulen++] = u;
-		high = 0;
-		return false;
-	}
-	if (u >= 0xD800 && u < 0xDC00) {
-		high = u;
-		return false;
-	}
-	if (u >= 0xDC00 && u < 0xE000)
-		return true;
-	units[ulen++] = u;
-	return false;
-}
-
-// decode into the UTF-16 scratch buffer, returns its length or -1
-function decodeUnits(s) {
+// decode s from start on, with the initial state, into the UTF-16 scratch
+// buffer, return its length or -1
+function decodeUnits(s, start) {
 	const slen = s.length;
 	if (units.length < 2 * slen)
 		units = new Uint16Array(2 * slen);
-	const dyn = INITIAL_OFFSET.slice();
-	let unicode = false, window = 0, i = 0;
-	ulen = 0;
-	high = 0;
+	const u = units, dyn = decDynamic;
+	for (let k = 0; k < 8; ++k)
+		dyn[k] = INITIAL_OFFSET[k];
+	let unicode = false, window = 0, i = start, n = 0;
+	// a high surrogate from SQU or unicode mode waiting for its low half
+	let high = 0;
 	while (i < slen) {
-		const b = s[i++];
+		let b = s[i++];
 		if (!unicode) {
-			if (b >= 0x80) {
-				if (putPoint(dyn[window] + b - 0x80))
+			if (b >= 0x80 || direct(b)) {
+				if (high)
 					return -1;
-			} else if (b >= 0x20 || b === 0x00 || b === 0x09 || b === 0x0A || b === 0x0D) {
-				if (putPoint(b))
+				const off = dyn[window];
+				if (off < 0x10000) {
+					// a BMP window only holds valid characters: write the whole run
+					for (;;) {
+						u[n++] = b >= 0x80 ? off + b - 0x80 : b;
+						if (i >= slen)
+							break;
+						b = s[i];
+						if (b < 0x80 && !direct(b))
+							break;
+						++i;
+					}
+				} else {
+					// so does one above it: SDX reaches no further than 0x10FF80
+					const base = off - 0x10000 - 0x80;
+					for (;;) {
+						if (b >= 0x80) {
+							const c = base + b;
+							u[n++] = 0xD800 + (c >> 10);
+							u[n++] = 0xDC00 + (c & 0x3FF);
+						} else {
+							u[n++] = b;
+						}
+						if (i >= slen)
+							break;
+						b = s[i];
+						if (b < 0x80 && !direct(b))
+							break;
+						++i;
+					}
+				}
+				continue;
+			}
+			let x;
+			if (b >= SQ0 && b < SQ0 + 8) {
+				if (i >= slen || high)
 					return -1;
-			} else if (b >= SQ0 && b < SQ0 + 8) {
-				if (i >= slen)
+				const t = s[i++], w = b - SQ0;
+				n = putPoint(u, n, t < 0x80 ? STATIC_OFFSET[w] + t : dyn[w] + t - 0x80);
+				if (n < 0)
 					return -1;
-				const t = s[i++], n = b - SQ0;
-				if (putPoint(t < 0x80 ? STATIC_OFFSET[n] + t : dyn[n] + t - 0x80))
-					return -1;
+				continue;
 			} else if (b === SDX) {
 				if (i + 2 > slen)
 					return -1;
 				const h = s[i++], l = s[i++];
 				window = h >> 5;
 				dyn[window] = 0x10000 + (((h & 0x1F) << 8) | l) * 0x80;
+				continue;
 			} else if (b === SQU) {
 				if (i + 2 > slen)
 					return -1;
-				if (putUnit(s[i] << 8 | s[i + 1]))
-					return -1;
+				x = s[i] << 8 | s[i + 1];
 				i += 2;
 			} else if (b === SCU) {
 				unicode = true;
+				continue;
 			} else if (b >= SC0 && b < SC0 + 8) {
 				window = b - SC0;
+				continue;
 			} else if (b >= SD0 && b < SD0 + 8) {
 				if (i >= slen)
 					return -1;
@@ -120,14 +145,35 @@ function decodeUnits(s) {
 				if (offset < 0)
 					return -1;
 				dyn[window] = offset;
+				continue;
 			} else {
 				return -1;
 			}
+			// one UTF-16 code unit from SQU, pairing surrogates
+			if (high) {
+				if (x < 0xDC00 || x >= 0xE000)
+					return -1;
+				u[n++] = high;
+				u[n++] = x;
+				high = 0;
+			} else if (x >= 0xD800 && x < 0xE000) {
+				if (x >= 0xDC00)
+					return -1;
+				high = x;
+			} else {
+				u[n++] = x;
+			}
 		} else {
-			if (b >= UC0 && b < UC0 + 8) {
+			let x;
+			if (b < UC0 || b > 0xF2) {
+				if (i >= slen)
+					return -1;
+				x = b << 8 | s[i++];
+			} else if (b < UD0) {
 				window = b - UC0;
 				unicode = false;
-			} else if (b >= UD0 && b < UD0 + 8) {
+				continue;
+			} else if (b < UQU) {
 				if (i >= slen)
 					return -1;
 				window = b - UD0;
@@ -136,11 +182,11 @@ function decodeUnits(s) {
 					return -1;
 				dyn[window] = offset;
 				unicode = false;
+				continue;
 			} else if (b === UQU) {
 				if (i + 2 > slen)
 					return -1;
-				if (putUnit(s[i] << 8 | s[i + 1]))
-					return -1;
+				x = s[i] << 8 | s[i + 1];
 				i += 2;
 			} else if (b === UDX) {
 				if (i + 2 > slen)
@@ -149,40 +195,95 @@ function decodeUnits(s) {
 				window = h >> 5;
 				dyn[window] = 0x10000 + (((h & 0x1F) << 8) | l) * 0x80;
 				unicode = false;
-			} else if (b === 0xF2) {
-				return -1;
+				continue;
 			} else {
-				if (i >= slen)
+				// 0xF2 is reserved
+				return -1;
+			}
+			// one UTF-16 code unit, pairing surrogates
+			if (high) {
+				if (x < 0xDC00 || x >= 0xE000)
 					return -1;
-				if (putUnit(b << 8 | s[i++]))
+				u[n++] = high;
+				u[n++] = x;
+				high = 0;
+			} else if (x >= 0xD800 && x < 0xE000) {
+				if (x >= 0xDC00)
 					return -1;
+				high = x;
+			} else {
+				u[n++] = x;
 			}
 		}
 	}
 	if (high)
 		return -1;
-	return ulen;
+	return n;
+}
+
+// length of the leading run of bytes that SCSU leaves as they are: ASCII
+// text decodes to itself, with the initial state still in place after it
+function directPrefix(s) {
+	let p = 0;
+	while (p < s.length && direct(s[p]))
+		++p;
+	return p;
 }
 
 // the scratch buffer is in platform byte order, which is little-endian everywhere JS runs
 const utf16Decoder = new TextDecoder("utf-16le");
+const asciiDecoder = new TextDecoder("utf-8");
 
+// TextDecoder beats String.fromCharCode even on a few characters
 function unitsToString(len) {
-	if (len < 64)
-		return String.fromCharCode.apply(null, units.subarray(0, len));
 	return utf16Decoder.decode(units.subarray(0, len));
 }
 
 export function decode(bytes) {
-	const len = decodeUnits(bytes);
-	return len < 0 ? null : unitsToString(len);
+	const p = directPrefix(bytes);
+	if (p === bytes.length)
+		return asciiDecoder.decode(bytes);
+	const len = decodeUnits(bytes, p);
+	if (len < 0)
+		return null;
+	const tail = unitsToString(len);
+	return p ? asciiDecoder.decode(bytes.subarray(0, p)) + tail : tail;
 }
 
-const utf8Encoder = new TextEncoder();
-
 export function decodeUTF8(bytes) {
-	const str = decode(bytes);
-	return str === null ? null : utf8Encoder.encode(str);
+	const p = directPrefix(bytes);
+	if (p === bytes.length)
+		return bytes.slice();
+	const len = decodeUnits(bytes, p);
+	if (len < 0)
+		return null;
+	// a unit takes at most three bytes, a surrogate pair four
+	if (utf8.length < p + 3 * len)
+		utf8 = new Uint8Array(p + 3 * len);
+	const o = utf8, u = units;
+	o.set(bytes.subarray(0, p));
+	let pos = p;
+	for (let k = 0; k < len; ++k) {
+		let c = u[k];
+		if (c < 0x80) {
+			o[pos++] = c;
+		} else if (c < 0x800) {
+			o[pos++] = 0xC0 | c >> 6;
+			o[pos++] = 0x80 | (c & 0x3F);
+		} else if (c < 0xD800 || c >= 0xDC00) {
+			o[pos++] = 0xE0 | c >> 12;
+			o[pos++] = 0x80 | (c >> 6 & 0x3F);
+			o[pos++] = 0x80 | (c & 0x3F);
+		} else {
+			// decodeUnits only writes complete surrogate pairs
+			c = 0x10000 + ((c - 0xD800) << 10) + (u[++k] - 0xDC00);
+			o[pos++] = 0xF0 | c >> 18;
+			o[pos++] = 0x80 | (c >> 12 & 0x3F);
+			o[pos++] = 0x80 | (c >> 6 & 0x3F);
+			o[pos++] = 0x80 | (c & 0x3F);
+		}
+	}
+	return o.slice(0, pos);
 }
 
 /* ---------------- encoder ---------------- */
